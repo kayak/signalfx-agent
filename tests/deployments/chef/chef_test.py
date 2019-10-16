@@ -58,6 +58,7 @@ DOCKERFILES_DIR = SCRIPT_DIR / "images"
 DEB_DISTROS = [
     ("debian-8-jessie", INIT_SYSTEMD),
     ("debian-9-stretch", INIT_SYSTEMD),
+    ("ubuntu1204", INIT_UPSTART),
     ("ubuntu1404", INIT_UPSTART),
     ("ubuntu1604", INIT_SYSTEMD),
     ("ubuntu1804", INIT_SYSTEMD),
@@ -73,7 +74,7 @@ RPM_DISTROS = [
 ]
 
 # allow CHEF_VERSIONS env var with comma-separated chef versions for test parameterization
-CHEF_VERSIONS = os.environ.get("CHEF_VERSIONS", "12.22.5,latest").split(",")
+CHEF_VERSIONS = os.environ.get("CHEF_VERSIONS", "13.0,latest").split(",")
 
 STAGE = os.environ.get("STAGE", "final")
 INITIAL_VERSION = os.environ.get("INITIAL_VERSION", "4.7.7")
@@ -87,16 +88,18 @@ WINDOWS_COOKBOOK_DIR = os.path.join(WIN_CHEF_COOKBOOKS_DIR, "windows")
 WINDOWS_COOKBOOK_URL = "https://supermarket.chef.io/cookbooks/windows/versions/6.0.0/download"
 
 
-def run_chef_client(cont, chef_version, agent_version, stage):
+def run_chef_client(cont, agent_version, stage):
     attributes = json.loads(ATTRIBUTES_JSON)
     attributes["signalfx_agent"]["agent_version"] = agent_version
     attributes["signalfx_agent"]["package_stage"] = stage
     print(attributes)
+    chef_version = re.search(r"(\d+\.\d+\.\d+)", cont.exec_run("chef-client --version").output.decode("utf-8")).group(0)
+    assert chef_version, "Failed to get chef version!"
     with tempfile.NamedTemporaryFile(mode="w", dir="/tmp/scratch") as fd:
         fd.write(json.dumps(attributes))
         fd.flush()
         cmd = CHEF_CMD.format(fd.name)
-        if chef_version == "latest" or int(chef_version.split(".")[0]) >= 15:
+        if int(chef_version.split(".")[0]) >= 15:
             cmd += " --chef-license accept-silent"
         print('running "%s" ...' % cmd)
         code, output = cont.exec_run(cmd)
@@ -118,29 +121,34 @@ def run_chef_client(cont, chef_version, agent_version, stage):
 )
 @pytest.mark.parametrize("chef_version", CHEF_VERSIONS)
 def test_chef(base_image, init_system, chef_version):
-    if base_image == "centos8" and chef_version != "latest" and int(chef_version.split(".")[0]) < 15:
-        pytest.skip(f"chef {chef_version} not supported on centos 8")
+    if chef_version != "latest":
+        if base_image == "centos8" and int(chef_version.split(".")[0]) < 15:
+            pytest.skip(f"chef {chef_version} not supported on centos 8")
+        elif base_image == "opensuse15" and int(chef_version.split(".")[0]) < 14:
+            pytest.skip(f"chef {chef_version} not supported on suse 15")
+        elif base_image == "ubuntu1204" and int(chef_version.split(".")[0]) > 13:
+            pytest.skip(f"chef {chef_version} not supported on ubuntu 12.04")
     buildargs = {"CHEF_INSTALLER_ARGS": ""}
     if chef_version != "latest":
         buildargs["CHEF_INSTALLER_ARGS"] = f"-v {chef_version}"
     opts = {"path": REPO_ROOT_DIR, "dockerfile": DOCKERFILES_DIR / f"Dockerfile.{base_image}", "buildargs": buildargs}
     with run_init_system_image(base_image, **opts) as [cont, backend]:
         try:
-            run_chef_client(cont, chef_version, INITIAL_VERSION, STAGE)
+            run_chef_client(cont, INITIAL_VERSION, STAGE)
             assert wait_for(
                 p(has_datapoint_with_dim, backend, "plugin", "host-metadata")
             ), "Datapoints didn't come through"
 
             # upgrade agent
-            run_chef_client(cont, chef_version, UPGRADE_VERSION, STAGE)
+            run_chef_client(cont, UPGRADE_VERSION, STAGE)
             backend.reset_datapoints()
             assert wait_for(
                 p(has_datapoint_with_dim, backend, "plugin", "host-metadata")
             ), "Datapoints didn't come through"
 
             # downgrade agent for distros that support package downgrades
-            if base_image not in ("debian-7-wheezy", "debian-8-jessie", "ubuntu1404"):
-                run_chef_client(cont, chef_version, INITIAL_VERSION, STAGE)
+            if base_image not in ("debian-7-wheezy", "debian-8-jessie", "ubuntu1204", "ubuntu1404"):
+                run_chef_client(cont, INITIAL_VERSION, STAGE)
                 backend.reset_datapoints()
                 assert wait_for(
                     p(has_datapoint_with_dim, backend, "plugin", "host-metadata")
